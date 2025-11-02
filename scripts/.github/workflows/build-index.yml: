@@ -1,0 +1,43 @@
+name: Build Whoosh Index
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "sources.yml"
+      - "scripts/build_index.py"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-index:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install whoosh pypdf requests pyyaml
+
+      - name: Build index from sources.yml
+        run: |
+          python scripts/build_index.py
+
+      - name: Commit index (if changed)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/indexdir
+          git diff --cached --quiet || git commit -m "ci: rebuild Whoosh index"
+          git push
