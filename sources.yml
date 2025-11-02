@@ -1,0 +1,16 @@
+# sources.yml — add/adjust as you like
+- url: "https://www.seslhd.health.nsw.gov.au/sites/default/files/groups/POWHED/docs/Tintinalli_Summary/Electrolytes/Hyperkalaemia.pdf"
+  title: "NSW Hyperkalaemia (ED Summary)"
+  org: "NSW Health"
+  published: "2019-01-01"
+
+- url: "https://www.allergy.org.au/images/stories/anaphylaxis/2024/ASCIA_HP_Anaphylaxis_Emergency_Management_Plan_2024.pdf"
+  title: "ASCIA Acute Anaphylaxis (2024)"
+  org: "ASCIA"
+  published: "2024-07-01"
+
+# Add more:
+# - url: "https://…"
+#   title: "…"
+#   org: "…"
+#   published: "YYYY-MM-DD"
