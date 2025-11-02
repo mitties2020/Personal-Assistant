@@ -14,3 +14,34 @@
 #   title: "…"
 #   org: "…"
 #   published: "YYYY-MM-DD"
+sources:
+
+  - title: "ASCIA Acute Anaphylaxis Guideline (2024)"
+    url: "https://www.allergy.org.au/images/stories/anaphylaxis/2024/ASCIA_HP_Anaphylaxis_Emergency_Management_Plan_2024.pdf"
+    org: "ASCIA"
+    published: "2024-07-01"
+
+  - title: "NSW Adult Sepsis Pathway"
+    url: "https://www.cec.health.nsw.gov.au/__data/assets/pdf_file/0007/917376/adult-sepsis-pathway.pdf"
+    org: "NSW Health CEC"
+    published: "2023-06-01"
+
+  - title: "NSW Hyperkalaemia Emergency Summary"
+    url: "https://www.seslhd.health.nsw.gov.au/sites/default/files/groups/POWHED/docs/Tintinalli_Summary/Electrolytes/Hyperkalaemia.pdf"
+    org: "NSW Health"
+    published: "2019-01-01"
+
+  - title: "QLD Electrolyte Replacement Guideline (Adults)"
+    url: "https://www.health.qld.gov.au/__data/assets/pdf_file/0027/1006587/electrolyte-prescribe-gline-adult.pdf"
+    org: "Queensland Health"
+    published: "2023-10-01"
+
+  - title: "WA IV Potassium Mandatory Standard"
+    url: "https://www.health.wa.gov.au/~/media/Files/Corporate/Policy-Frameworks/Clinical-Governance-Safety-and-Quality/Policy/High-Risk-Medication-Policy/Supporting/Mandatory-Standard-for-Intravenous-Potassium.pdf"
+    org: "WA Health"
+    published: "2019-03-01"
+
+  - title: "QAS Anaphylaxis Protocol"
+    url: "https://www.ambulance.qld.gov.au/__data/assets/pdf_file/0019/219043/cpg_anaphylaxis-and-allergy.pdf"
+    org: "QAS"
+    published: "2022-06-01"
