@@ -2,7 +2,6 @@ from flask_cors import CORS
 
 APP = Flask(__name__)
 CORS(APP, resources={r"/answer": {"origins": "*"}, r"/health": {"origins": "*"}})
-
 # ---- OpenAI (optional but recommended) ----
 from openai import OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
