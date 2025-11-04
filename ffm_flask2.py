@@ -1,14 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import os, json, hashlib, datetime as dt
-from openai import OpenAI
-from supabase import create_client, Client
-
-APP = Flask(__name__)
-CORS(APP)
 import os
-from flask import Flask, request, jsonify
-from flask_cors import CORS
 
 # Optional deps (safe if not configured)
 try:
@@ -17,26 +9,21 @@ except Exception:
     OpenAI = None
 
 try:
-    from supabase import create_client
+    from supabase import create_client  # not used yet; keeps future DB option
 except Exception:
     create_client = None
 
 APP = Flask(__name__)
 CORS(APP, resources={r"/answer": {"origins": "*"}, r"/health": {"origins": "*"}})
 
-# --- Optional: OpenAI ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+# --- OpenAI (optional but recommended) ---
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 oa_client = OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
 
-# --- Optional: Supabase (not required to boot) ---
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
-sb = None
-if create_client and SUPABASE_URL and SUPABASE_SERVICE_KEY:
-    try:
-        sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-    except Exception:
-        sb = None
+# --- Supabase (optional; not required to boot) ---
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
+SUPABASE_SERVICE_KEY = (os.getenv("SUPABASE_SERVICE_KEY") or "").strip()
+sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if (create_client and SUPABASE_URL and SUPABASE_SERVICE_KEY) else None
 
 @APP.route("/health", methods=["GET"])
 def health():
@@ -52,7 +39,7 @@ with exactly these sections:
 3) Immediate management (first-line actions & doses)
 4) Ongoing care / monitoring
 
-Be specific with adult doses/units/routes (e.g., adrenaline 0.5 mg IM; Ca gluconate 10% 10 mL IV over 2–5 min).
+Be specific with adult doses/units/routes (e.g., adrenaline 0.5 mg IM; calcium gluconate 10% 10 mL IV over 2–5 min).
 Prefer Australian guidance when principles are equivalent.
 
 Question: {question}
@@ -84,6 +71,6 @@ def answer():
         "sources": []
     })
 
-# WSGI entrypoint for gunicorn
+# gunicorn entrypoint
 if __name__ == "__main__":
     APP.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
