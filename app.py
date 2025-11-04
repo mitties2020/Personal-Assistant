@@ -1,25 +1,24 @@
-# filename: ffm_flask2.py
+# app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
-from openai import OpenAI  # SDK works for DeepSeek too
+from openai import OpenAI  # used for DeepSeek too
 
-APP = Flask(__name__)
-CORS(APP, resources={r"/answer": {"origins": "*"}, r"/health": {"origins": "*"}, r"/whoami": {"origins": "*"}})
+app = Flask(__name__)
+CORS(app, resources={r"/answer": {"origins": "*"}, r"/health": {"origins": "*"}, r"/whoami": {"origins": "*"}})
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 ds_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com") if DEEPSEEK_API_KEY else None
 
-@APP.route("/health")
+@app.route("/health")
 def health():
     return jsonify({"ok": True})
 
-@APP.route("/whoami")
+@app.route("/whoami")
 def whoami():
     return jsonify({
         "provider": "deepseek" if ds_client else "none",
-        "base_url": "https://api.deepseek.com" if ds_client else None,
-        "has_OPENAI_API_KEY": bool(os.getenv("OPENAI_API_KEY"))
+        "base_url": "https://api.deepseek.com" if ds_client else None
     })
 
 PROMPT = """You are an Australian ED clinical assistant. Answer succinctly (~180 words)
@@ -31,7 +30,7 @@ with sections:
 Question: {q}
 """
 
-@APP.route("/", methods=["GET"])
+@app.route("/", methods=["GET"])
 def root():
     return """<!doctype html><meta charset="utf-8"><title>Personal Assistant</title>
 <style>body{font-family:system-ui,Arial,sans-serif;max-width:680px;margin:24px auto;padding:0 16px}
@@ -50,7 +49,7 @@ document.getElementById('ask').onclick = async () => {
 };
 </script>"""
 
-@APP.route("/answer", methods=["POST"])
+@app.route("/answer", methods=["POST"])
 def answer():
     data = request.get_json(silent=True) or {}
     q = (data.get("question") or "").strip()
@@ -70,4 +69,4 @@ def answer():
         return jsonify({"ok": False, "error": f"AI unavailable: {e}"}), 200
 
 if __name__ == "__main__":
-    APP.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
