@@ -2,67 +2,67 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 
-# ---- DeepSeek client ----
 try:
     from openai import OpenAI
 except:
     OpenAI = None
 
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
-client = None
-if OpenAI and DEEPSEEK_API_KEY:
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
-
-# ---- Flask App ----
 APP = Flask(__name__)
 CORS(APP, resources={r"/answer": {"origins": "*"}, r"/health": {"origins": "*"}})
 
-@APP.route("/")
-def home():
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+
+# DeepSeek client (using OpenAI SDK)
+ds_client = OpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com"
+) if (OpenAI and DEEPSEEK_API_KEY) else None
+
+@APP.route("/", methods=["GET"])
+def UI():
     return """
-    <h2>Medical Assistant (DeepSeek)</h2>
-    <p>POST to /answer with question</p>
+    <h2>Personal Assistant</h2>
+    <textarea id='q' style='width:100%;height:100px'></textarea><br>
+    <button onclick='ask()'>Ask</button>
+    <pre id='a'></pre>
+    <script>
+    async function ask() {
+        let q = document.getElementById('q').value;
+        let r = await fetch('/answer', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({question:q})});
+        let j = await r.json();
+        document.getElementById('a').textContent = j.answer || j.error;
+    }
+    </script>
     """
 
-@APP.route("/health", methods=["GET"])
+@APP.route("/health")
 def health():
     return jsonify({"ok": True})
 
-def build_prompt(q):
-    return f"""
-You are an Australian Medicine clinical assistant.
-
-Produce ~150 words with these sections:
-
-1) What it is & criteria
-2) Causes / complications
-3) Immediate management (with doses)
-4) Ongoing care / monitoring
-
-Use Australian guidelines if applicable.
-Question: {q}
-"""
-
 @APP.route("/answer", methods=["POST"])
 def answer():
-    if not client:
-        return jsonify({"ok": False, "error": "DeepSeek API key missing"}), 200
-
-    data = request.get_json(silent=True) or {}
+    data = request.get_json() or {}
     q = (data.get("question") or "").strip()
+
     if not q:
         return jsonify({"ok": False, "error": "Missing question"}), 400
 
+    if not ds_client:
+        return jsonify({"ok": False, "error": "DeepSeek not configured"}), 200
+
     try:
-        res = client.chat.completions.create(
+        res = ds_client.chat.completions.create(
             model="deepseek-chat",
-            messages=[{"role": "user", "content": build_prompt(q)}],
-            temperature=0.2,
+            messages=[
+                {"role": "system", "content": "You are a concise medical assistant for ED doctors in Australia."},
+                {"role": "user", "content": q}
+            ]
         )
-        answer = res.choices[0].message.content
-        return jsonify({"ok": True, "answer": answer})
+        text = res.choices[0].message.content.strip()
+        return jsonify({"ok": True, "answer": text})
+
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 200
+        return jsonify({"ok": False, "error": f"DeepSeek error: {e}"}), 200
 
 if __name__ == "__main__":
     APP.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
