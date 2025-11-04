@@ -20,7 +20,7 @@ CORS(APP, resources={r"/answer": {"origins": "*"}, r"/health": {"origins": "*"}}
 @APP.route("/")
 def home():
     return """
-    <h2>Aussie ED Assistant (DeepSeek)</h2>
+    <h2>Medical Assistant (DeepSeek)</h2>
     <p>POST to /answer with question</p>
     """
 
@@ -30,7 +30,7 @@ def health():
 
 def build_prompt(q):
     return f"""
-You are an Australian Emergency Medicine clinical assistant.
+You are an Australian Medicine clinical assistant.
 
 Produce ~150 words with these sections:
 
