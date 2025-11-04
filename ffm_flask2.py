@@ -6,7 +6,6 @@ CORS(APP, resources={r"/answer": {"origins": "*"}, r"/health": {"origins": "*"}}
 from openai import OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 oa_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
 # ---- Supabase optional ----
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
