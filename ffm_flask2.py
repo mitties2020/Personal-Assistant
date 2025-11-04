@@ -1,274 +1,290 @@
-import os, re, hashlib, datetime, json, io
+# ffm_flask2.py
+# Minimal clinical assistant API + UI backed by Supabase
+#
+# ENV required on Render:
+#   SUPABASE_URL=https://xxxxx.supabase.co
+#   SUPABASE_SERVICE_KEY=eyJhbGciOi...
+#
+# TABLE (public.guidelines), suggested columns:
+#   id uuid PK default gen_random_uuid()
+#   title text
+#   org text
+#   url text
+#   published timestamp with time zone (nullable)
+#   text text
+#   created_at timestamp default now()
+#
+# RLS: enable; add policy to ALLOW SELECT for all (using: true).
+# (Keep INSERT restricted; we ingest via service key on the server side.)
+
+from __future__ import annotations
+import os, re, html
+from datetime import datetime
+from typing import List, Dict, Any
+
 from flask import Flask, request, jsonify, Response
-from pypdf import PdfReader
 from supabase import create_client, Client
-import httpx
 
 APP = Flask(__name__)
 
-# -------- env & supabase ----------
-SB_URL = os.environ.get("SUPABASE_URL", "")
-SB_ANON = os.environ.get("SUPABASE_ANON_KEY", "")
-SB_SERVICE = os.environ.get("SUPABASE_SERVICE_ROLE", "")
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+# -------------------- Supabase client --------------------
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-def sb() -> Client:
-    key = SB_SERVICE or SB_ANON
-    return create_client(SB_URL, key)
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_KEY env vars.")
 
-# --------- helpers ----------
-def _clean(s: str) -> str:
-    if not s: return ""
-    s = re.sub(r"\s+", " ", s)
-    s = s.replace("\uf0a7", "•")
-    return s.strip()
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+# -------------------- Helpers --------------------
+def _sentences(txt: str) -> List[str]:
+    """Split into sentences & bullet lines, keep shortish chunks."""
+    if not txt:
+        return []
+    # normalize bullets/newlines
+    t = re.sub(r"\r\n?", "\n", txt)
+    t = re.sub(r"[ \t]+", " ", t)
+    lines = [l.strip() for l in t.split("\n") if l.strip()]
+    # split paragraphs into sentences
+    out: List[str] = []
+    for ln in lines:
+        if re.match(r"^[-•\d\)\(•]\s", ln):
+            out.append(ln)
+        else:
+            parts = re.split(r"(?<=[\.\?\!])\s+", ln)
+            out.extend([p.strip() for p in parts if p.strip()])
+    # clip overly long pieces
+    return [s[:500] for s in out if 10 <= len(s) <= 500]
+
+_IMMEDIATE_RE = re.compile(
+    r"\b(immediate|first[-\s]?line|stat|urgent|airway|breathing|circulation|"
+    r"resus|abcde|adrenaline|epinephrine|calcium|insulin|dextrose|hyperton|3%|"
+    r"magnesium|ceftriaxone|piperacillin|tazobactam|vancomycin|bolus|defibrill)\b",
+    re.I,
+)
+_DOSE_RE = re.compile(r"\b(\d+(\.\d+)?)\s?(mcg|mg|g|mL|ml|%)\b", re.I)
+_ROUTE_RE = re.compile(r"\b(iv|im|po|neb|infus|bolus)\b", re.I)
+_CRITERIA_RE = re.compile(r"\b(definition|criteria|diagnos|meets|signs?|symptoms?)\b", re.I)
+_CAUSES_RE = re.compile(r"\b(causes?|triggers?|aetiolog|etiolog|risk)\b", re.I)
+_COMP_RE = re.compile(r"\b(complication|shock|arrhythm|arrest|oedema|edema)\b", re.I)
+_FOLLOW_RE = re.compile(r"\b(monitor|observe|repeat|titrate|admit|review|"
+                        r"escalate|red flags?|disposition|reassess|ecg)\b", re.I)
 
 def _score_sentence(s: str) -> int:
     s2 = s.lower()
     score = 0
-    if re.search(r"\b(immediate|first[-\s]?line|stat|urgent|resus|airway|breathing|circulation|defibrill)\b", s2):
-        score += 6
-    if re.search(r"\b(\d+(\.\d+)?)\s?(mg|mcg|g|ml|mL|%)\b", s2): score += 3
-    if re.search(r"\b(iv|im|neb|bolus|infus|repeat|titrate|monitor|ecg)\b", s2): score += 2
-    if re.search(r"\b(adrenaline|epinephrine|calcium|insulin|dextrose|salbutamol|bicarbonate|potassium|magnesium|ceftriaxone|piperacillin|vancomycin)\b", s2):
-        score += 2
-    if re.match(r'^\s*[-•\d\)]\s', s): score += 1
-    L = len(s); 
-    if L: score += min(L//120, 2)
+    if _IMMEDIATE_RE.search(s2): score += 8
+    if _DOSE_RE.search(s2): score += 4
+    if __ROUTE_RE.search(s2): score += 3
+    if s.strip().startswith(("-", "•")): score += 1
+    # prefer informative length
+    L = len(s)
+    score += 1 if 80 <= L <= 240 else 0
     return score
 
-def _chunks(text: str, max_chars=2000):
-    sents = re.split(r"(?<=[\.\?!])\s+", text.strip())
-    out, cur = [], []
-    for s in sents:
-        if sum(len(x) for x in cur)+len(s) > max_chars and cur:
-            out.append(" ".join(cur)); cur=[s]
-        else:
-            cur.append(s)
-    if cur: out.append(" ".join(cur))
-    return out
+def _categorise(s: str) -> str:
+    s2 = s.lower()
+    if _IMMEDIATE_RE.search(s2) or _DOSE_RE.search(s2): return "Immediate"
+    if _CRITERIA_RE.search(s2): return "Definition/Criteria"
+    if _CAUSES_RE.search(s2) or _COMP_RE.search(s2): return "Causes/Complications"
+    if _FOLLOW_RE.search(s2): return "Ongoing"
+    # fallback: put in the first section that needs filling
+    return "Definition/Criteria"
 
-def _pdf_to_text(byts: bytes) -> str:
-    buf = io.BytesIO(byts)
-    try:
-        reader = PdfReader(buf)
-        pages = []
-        for p in reader.pages:
-            pages.append(p.extract_text() or "")
-        return "\n".join(pages)
-    except Exception:
-        return ""
+def _clean_for_html(s: str) -> str:
+    # join hyphen linebreak splits, un-weird spacing, escape, keep bullets
+    s = re.sub(r"(\w)-\s+(\w)", r"\1\2", s)
+    s = re.sub(r"[ \t]+", " ", s).strip()
+    return html.escape(s)
 
-def _fetch_text_from_url(url: str) -> tuple[str, bytes]:
-    with httpx.Client(follow_redirects=True, timeout=60) as cx:
-        r = cx.get(url)
-        r.raise_for_status()
-        ctype = r.headers.get("content-type","")
-        data = r.content
-        if "pdf" in ctype or url.lower().endswith(".pdf"):
-            txt = _pdf_to_text(data)
-        else:
-            # basic HTML strip
-            body = r.text
-            body = re.sub(r"(?is)<script.*?>.*?</script>", " ", body)
-            body = re.sub(r"(?is)<style.*?>.*?</style>", " ", body)
-            body = re.sub(r"(?is)<.*?>", " ", body)
-            txt = body
-        return (_clean(txt), data)
+def _render_answer(blocks: Dict[str, List[str]]) -> str:
+    order = ["Definition/Criteria", "Causes/Complications", "Immediate", "Ongoing"]
+    titles = {
+        "Definition/Criteria": "What it is & how to recognise it",
+        "Causes/Complications": "Common causes & complications",
+        "Immediate": "Immediate management (first steps & doses)",
+        "Ongoing": "Monitoring / follow-up",
+    }
+    html_parts = []
+    for key in order:
+        items = blocks.get(key, [])
+        if not items: continue
+        html_parts.append(f"<h4 style='margin:8px 0 6px'>{titles[key]}</h4>")
+        lis = "".join(f"<li>{_clean_for_html(x)}</li>" for x in items)
+        html_parts.append(f"<ul style='margin:6px 0 10px 18px'>{lis}</ul>")
+    return "".join(html_parts) if html_parts else "<p>No matches found in your knowledge base.</p>"
 
-def _sha256(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
-def _format_doctor_answer(defn, causes, immediate, ongoing) -> str:
-    parts = []
-    def block(title, items):
-        if not items: return ""
-        lis = "".join([f"<li>{_clean(x)}</li>" for x in items[:8]])
-        return f"<h4 style='margin:8px 0 6px'>{title}</h4><ul style='margin:6px 0 10px 18px'>{lis}</ul>"
-    parts.append(block("Definition / diagnostic criteria", defn))
-    parts.append(block("Common causes / complications", causes))
-    parts.append(block("Immediate management (first 60–90 minutes)", immediate))
-    parts.append(block("Ongoing care / details", ongoing))
-    return "".join([p for p in parts if p])
-
-# --------- data access ----------
-TABLE = "clinical_guidelines"
-
-def _search_supabase(q: str, k: int = 18):
-    # very simple token OR search on title/text via ilike
-    tokens = [t for t in re.split(r"[^A-Za-z0-9%]+", q) if t]
-    tokens = tokens[:6] or [q]
-    client = sb()
-    hits = {}
-    for t in tokens:
-        like = f"%{t}%"
-        data = client.table(TABLE).select("id,title,org,published,text").ilike("text", like).limit(k).execute().data
-        for row in data or []:
-            rid = row["id"]
-            if rid not in hits:
-                hits[rid] = row
-    # crude relevance: count token hits + presence of “immediate/dose”
-    scored = []
-    for r in hits.values():
-        txt = (r.get("text") or "").lower()
-        s = sum(txt.count(t.lower()) for t in tokens)
-        if re.search(r"\b(immediate|stat|first[-\s]?line)\b", txt): s += 2
-        if re.search(r"\b(\d+(\.\d+)?)\s?(mg|mcg|g|ml|%)\b", txt): s += 1
-        scored.append((s, r))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [r for _, r in scored[:k]]
-
-def _distill_sections(texts: list[str], question: str):
-    # pick top sentences for each section
-    all_sents = []
-    for t in texts:
-        for s in re.split(r"(?<=[\.\?!])\s+", t):
-            ss = _clean(s)
-            if 6 <= len(ss) <= 500:
-                all_sents.append(ss)
-    def pick(filter_regex=None, extra=None, n=6):
-        cand = []
-        for s in all_sents:
-            if filter_regex and not re.search(filter_regex, s, re.I): 
-                continue
+def _pick_sentences(rows: List[Dict[str, Any]], q: str) -> (str, List[Dict[str, str]]):
+    # collect candidate sentences with scores
+    cand: List[Dict[str, Any]] = []
+    for r in rows:
+        sents = _sentences(r.get("text") or "")
+        for s in sents:
             score = _score_sentence(s)
-            if extra: score += extra(s)
-            cand.append((score, s))
-        cand.sort(key=lambda x:x[0], reverse=True)
-        return [s for _, s in cand[:n]]
+            # light boost if query tokens appear
+            for tok in set(re.findall(r"[a-z0-9]{3,}", q.lower())):
+                if tok in s.lower(): score += 1
+            cand.append({"score": score, "sent": s, "row": r})
 
-    defs = pick(r"\b(definition|diagnos|criteria|triad|signs|symptoms|presentation)\b", n=6)
-    causes = pick(r"\b(cause|trigger|risk|aetiol|etiol|complication)\b", n=6)
-    immediate = pick(r"\b(immediate|first[-\s]?line|stat|adrenaline|epinephrine|calcium|insulin|dextrose|bolus|infus|iv|im)\b", n=8)
-    ongoing = pick(None, n=8)  # leftovers/most practical high-score lines
-    return defs, causes, immediate, ongoing
+    # sort by score and keep top N sentences
+    cand.sort(key=lambda x: x["score"], reverse=True)
+    top = cand[:60]
 
-# --------- routes ----------
+    # bucket into 4 sections, keep 3/3/6/4 items respectively
+    slots = {"Definition/Criteria": 3, "Causes/Complications": 3, "Immediate": 6, "Ongoing": 4}
+    chosen: Dict[str, List[str]] = {k: [] for k in slots}
+    srcs: List[Dict[str, str]] = []
+    used_row_ids = set()
+
+    for c in top:
+        cat = _categorise(c["sent"])
+        if len(chosen[cat]) < slots[cat]:
+            chosen[cat].append(c["sent"])
+            rid = c["row"].get("id")
+            if rid and rid not in used_row_ids:
+                used_row_ids.add(rid)
+                srcs.append({
+                    "title": c["row"].get("title") or "",
+                    "org": c["row"].get("org") or "",
+                    "published": (c["row"].get("published") or "") if isinstance(c["row"].get("published"), str)
+                                 else (c["row"].get("published").isoformat() if c["row"].get("published") else ""),
+                    "url": c["row"].get("url") or ""
+                })
+
+    return _render_answer(chosen), srcs[:8]
+
+# -------------------- Search (Supabase) --------------------
+def _supa_search(q: str, limit: int = 80) -> List[Dict[str, Any]]:
+    """
+    Simple OR/ILIKE search across title, org, text.
+    """
+    terms = re.findall(r"[A-Za-z0-9]{3,}", q)
+    if not terms:
+        res = supabase.table("guidelines").select("*").limit(20).execute()
+        return res.data or []
+
+    # Build PostgREST OR filter: title.ilike.%term%,text.ilike.%term%,org.ilike.%term%,...
+    parts = []
+    for t in set(terms):
+        pat = f"%{t}%"
+        parts.append(f"title.ilike.{pat}")
+        parts.append(f"text.ilike.{pat}")
+        parts.append(f"org.ilike.{pat}")
+    filt = ",".join(parts)
+
+    res = supabase.table("guidelines").select("*").or_(filt).limit(limit).execute()
+    return res.data or []
+
+# -------------------- Routes --------------------
 @APP.route("/health")
 def health():
     return jsonify({"ok": True})
 
-# Minimal UI (unchanged)
-@APP.route("/", methods=["GET"])
-def home():
-    html = """
-<!doctype html><html lang="en"><head><meta charset="utf-8">
-<title>Clinical Assistant — Doctor View</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-:root{font-family:system-ui,sans-serif} body{margin:24px;max-width:900px}
-h1{margin:0 0 10px} .small{color:#6b7280;font-size:12.5px}
-textarea{width:100%;min-height:86px;padding:10px;border:1px solid #e5e7eb;border-radius:10px;font-size:15px}
-button{padding:10px 14px;border:0;border-radius:10px;background:#111827;color:white;font-weight:600;cursor:pointer}
-#answerText{margin-top:14px;border:1px solid #e5e7eb;border-radius:12px;padding:14px;font-size:15.5px;line-height:1.4;background:#fafafa}
-#srcs .src{color:#374151;font-size:12.5px;margin:4px 0}
-</style></head><body>
-<h1>Clinical Assistant</h1>
-<div class="small">One-line question in → succinct 4-part answer out.</div>
-<textarea id="q" placeholder="e.g., Hyperkalaemia with broad QRS: definition, causes, immediate management"></textarea>
-<div style="margin-top:8px"><button id="ask">Answer</button></div>
-<div id="ans" style="display:none">
-  <h3>Answer</h3>
-  <div id="answerText"></div>
-  <div id="srcs"></div>
-</div>
-<script>
-const $ = s => document.querySelector(s);
-$("#ask").onclick = async () => {
-  const q = $("#q").value.trim(); if (!q) return;
-  $("#ans").style.display = "block";
-  $("#answerText").innerHTML = "Working…";
-  $("#srcs").innerHTML = "";
-  try {
-    const r = await fetch("/answer", {method:"POST",headers:{"Content-Type":"application/json"},body: JSON.stringify({question:q,k:18})});
-    const j = await r.json();
-    $("#answerText").innerHTML = j.answer || "No matches.";
-    const srcs = (j.sources||[]).map(s => `<div class="src">• ${s.title||'Untitled'} — ${s.org||''} ${s.published?('('+s.published.slice(0,10)+')'):''}</div>`).join("");
-    $("#srcs").innerHTML = srcs ? `<div class="small" style="margin-top:6px">Sources</div>${srcs}` : "";
-  } catch(e){ $("#answerText").textContent = "Error: " + e.message; }
-};
-</script></body></html>
-"""
-    return Response(html, mimetype="text/html")
-
 @APP.route("/answer", methods=["POST"])
 def answer():
-    data = request.get_json(force=True) or {}
-    q = (data.get("question") or "").strip()
-    k = int(data.get("k") or 18)
+    # Accept either JSON body or form field 'q'
+    if request.is_json:
+        payload = request.get_json(silent=True) or {}
+        q = (payload.get("question") or payload.get("q") or "").strip()
+        k = int(payload.get("k") or 12)
+    else:
+        q = (request.form.get("q") or "").strip()
+        k = int(request.form.get("k") or 12)
     if not q:
-        return jsonify({"ok": True, "answer": "<p>Ask a clinical question.</p>", "sources": []})
-    rows = _search_supabase(q, k=k)
+        return jsonify({"ok": False, "error": "Empty question"}), 400
+
+    rows = _supa_search(q, limit=max(40, k * 6))
     if not rows:
-        return jsonify({"ok": True, "answer": "<p>No matches found in your evidence set.</p>", "sources": []})
-    texts = [r.get("text") or "" for r in rows]
-    d, c, im, on = _distill_sections(texts, q)
-    html = _format_doctor_answer(d, c, im, on)
-    srcs = [{"title": r.get("title"), "org": r.get("org"), "published": r.get("published")} for r in rows[:6]]
-    return jsonify({"ok": True, "answer": html, "sources": srcs})
+        return jsonify({"ok": True, "answer": "<p>No matches found in your knowledge base.</p>", "sources": []})
 
-# --------- ingestion (server-side only, use Admin-Key) ----------
-def _require_admin():
-    key = request.headers.get("Admin-Key") or request.headers.get("X-Admin-Key")
-    if not ADMIN_KEY or key != ADMIN_KEY:
-        return jsonify({"ok": False, "error": "unauthorised"}), 401
-
-@APP.route("/ingest_link", methods=["POST"])
-def ingest_link():
-    auth = _require_admin()
-    if auth: return auth
-    title = request.form.get("title","").strip()
-    org = request.form.get("org","").strip()
-    published = request.form.get("published","").strip()
-    url = request.form.get("url","").strip()
-    if not url:
-        return jsonify({"ok": False, "error":"url required"}), 400
-    txt, byts = _fetch_text_from_url(url)
-    if not txt.strip():
-        return jsonify({"ok": False, "error":"no text extracted"}), 400
-    digest = _sha256(byts)
-    pub = None
-    try:
-        if published: pub = datetime.datetime.fromisoformat(published)
-    except Exception:
-        pub = None
-    row = {
-        "title": title or url,
-        "org": org,
-        "published": pub.isoformat() if pub else None,
-        "url": url,
-        "sha256": digest,
-        "text": _clean(txt)
-    }
-    res = sb().table(TABLE).upsert(row, on_conflict="sha256").execute()
-    return jsonify({"ok": True, "inserted": bool(res.data)})
+    html_answer, srcs = _pick_sentences(rows, q)
+    return jsonify({"ok": True, "answer": html_answer, "sources": srcs})
 
 @APP.route("/ingest_text", methods=["POST"])
 def ingest_text():
-    auth = _require_admin()
-    if auth: return auth
-    j = request.get_json(force=True) or {}
-    title = (j.get("title") or "").strip()
-    org = (j.get("org") or "").strip()
-    published = (j.get("published") or "").strip()
-    text = (j.get("text") or "").strip()
+    """
+    Ingest a single guideline paragraph/page into Supabase.
+    Body: {"title": "...", "org":"...", "url":"...", "published":"2024-06-01", "text":"..."}
+    """
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
     if not text:
-        return jsonify({"ok": False, "error":"text required"}), 400
-    pub = None
+        return jsonify({"ok": False, "error": "No text"}), 400
+    title = data.get("title") or ""
+    org = data.get("org") or ""
+    url = data.get("url") or ""
+    published = data.get("published")
     try:
-        if published: pub = datetime.datetime.fromisoformat(published)
+        pub_dt = datetime.fromisoformat(published) if published else None
     except Exception:
-        pub = None
-    row = {
-        "title": title or "Untitled",
-        "org": org,
-        "published": pub.isoformat() if pub else None,
-        "url": None,
-        "sha256": hashlib.sha256(text.encode()).hexdigest(),
-        "text": _clean(text)
-    }
-    res = sb().table(TABLE).upsert(row, on_conflict="sha256").execute()
-    return jsonify({"ok": True, "inserted": bool(res.data)})
+        pub_dt = None
 
+    ins = {
+        "title": title, "org": org, "url": url, "text": text
+    }
+    if pub_dt:
+        ins["published"] = pub_dt.isoformat()
+
+    res = supabase.table("guidelines").insert(ins).execute()
+    return jsonify({"ok": True, "inserted": res.data})
+
+# -------------------- UI --------------------
+@APP.route("/")
+def home():
+    return Response("""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>FFM — Doctor View</title>
+<style>
+  :root { color-scheme: light dark; --ink:#0f172a; --mut:#475569; --pill:#e2e8f0;}
+  body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial; margin:24px; color:var(--ink); }
+  h1 { font-size:22px; margin:0 0 6px; }
+  .small { color:var(--mut); font-size:12.5px;}
+  textarea { width:100%; height:88px; padding:12px; font: 14px/1.4 ui-sans-serif; border:1px solid #cbd5e1; border-radius:10px; outline:none }
+  button { margin-top:10px; padding:10px 14px; border-radius:12px; border:1px solid #0ea5e9; background:#0ea5e9; color:white; font-weight:600; cursor:pointer }
+  #ans { margin-top:16px; }
+  #answerText { font-size:15px; line-height:1.45; white-space:normal }
+  h4 { font-size:15px; margin:12px 0 8px }
+  ul { margin:6px 0 12px 18px }
+  li { margin:4px 0 }
+  .pill { display:inline-block; background:var(--pill); padding:2px 8px; border-radius:999px; font-size:11.5px; margin-right:6px }
+</style>
+</head><body>
+  <h1>FFM — Doctor View</h1>
+  <div class="small">One-line question in → succinct 4-part answer out.</div>
+  <textarea id="q" placeholder="e.g., Hyperkalaemia with wide QRS: definition, causes, immediate management"></textarea>
+  <div><button id="askBtn">Answer</button></div>
+  <div id="ans" style="display:none">
+    <div id="answerText"></div>
+    <div id="srcs" class="small"></div>
+  </div>
+<script>
+const $ = s => document.querySelector(s);
+async function ask(){
+  const q = $("#q").value.trim(); if(!q) return;
+  $("#ans").style.display="block";
+  $("#answerText").innerHTML = "<div class='small'>Working…</div>";
+  $("#srcs").innerHTML = "";
+  try {
+    const r = await fetch("/answer", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({question:q, k: 14})});
+    const j = await r.json();
+    $("#answerText").innerHTML = j.answer || "No matches.";
+    const srcs = (j.sources||[]).map(s => {
+      const bits = [s.org||"", s.title||"", s.published?("("+s.published.slice(0,10)+")"):""].filter(Boolean).join(" — ");
+      const link = s.url ? `<a href="${s.url}" target="_blank" rel="noopener">link</a>` : "";
+      return `<div class="small">• ${bits} ${link}</div>`;
+    }).join("");
+    $("#srcs").innerHTML = srcs ? `<div style="margin-top:8px"><span class="pill">Sources</span></div>${srcs}` : "";
+  } catch(e){
+    $("#answerText").textContent = "Error: " + (e && e.message || e);
+  }
+}
+$("#askBtn").onclick = ask;
+</script>
+</body></html>""", mimetype="text/html")
+
+# -------------------- Entrypoint --------------------
 if __name__ == "__main__":
-    APP.run(host="0.0.0.0", port=8000)
+    # Local dev
+    APP.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
