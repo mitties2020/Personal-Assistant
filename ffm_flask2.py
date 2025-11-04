@@ -2,19 +2,13 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
-
-# DeepSeek uses the OpenAI SDK but with DeepSeek base_url
-from openai import OpenAI
+from openai import OpenAI  # SDK works for DeepSeek too
 
 APP = Flask(__name__)
 CORS(APP, resources={r"/answer": {"origins": "*"}, r"/health": {"origins": "*"}, r"/whoami": {"origins": "*"}})
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
-
-# Create client ONLY for DeepSeek
-ds_client = None
-if DEEPSEEK_API_KEY:
-    ds_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+ds_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com") if DEEPSEEK_API_KEY else None
 
 @APP.route("/health")
 def health():
@@ -25,11 +19,10 @@ def whoami():
     return jsonify({
         "provider": "deepseek" if ds_client else "none",
         "base_url": "https://api.deepseek.com" if ds_client else None,
-        # helps confirm you did NOT leave OPENAI_API_KEY around
         "has_OPENAI_API_KEY": bool(os.getenv("OPENAI_API_KEY"))
     })
 
-PROMPT_TMPL = """You are an Australian ED clinical assistant. Answer succinctly (~180 words)
+PROMPT = """You are an Australian ED clinical assistant. Answer succinctly (~180 words)
 with sections:
 1) What it is & criteria
 2) Causes/complications
@@ -63,20 +56,17 @@ def answer():
     q = (data.get("question") or "").strip()
     if not q:
         return jsonify({"ok": False, "error": "Missing 'question'"}), 400
-
     if not ds_client:
         return jsonify({"ok": False, "error": "DeepSeek not configured. Set DEEPSEEK_API_KEY and redeploy."}), 200
-
     try:
-        resp = ds_client.chat.completions.create(
+        r = ds_client.chat.completions.create(
             model="deepseek-chat",
-            messages=[{"role": "user", "content": PROMPT_TMPL.format(q=q)}],
+            messages=[{"role": "user", "content": PROMPT.format(q=q)}],
             temperature=0.2,
         )
-        text = (resp.choices[0].message.content or "").strip()
+        text = (r.choices[0].message.content or "").strip()
         return jsonify({"ok": True, "answer": text, "sources": []})
     except Exception as e:
-        # Keep server up even if provider errors
         return jsonify({"ok": False, "error": f"AI unavailable: {e}"}), 200
 
 if __name__ == "__main__":
