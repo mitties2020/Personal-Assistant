@@ -16,13 +16,9 @@ def health():
 
 @app.route("/whoami")
 def whoami():
-    return jsonify({
-        "provider": "deepseek" if ds_client else "none",
-        "base_url": "https://api.deepseek.com" if ds_client else None
-    })
+    return jsonify({"provider": ("deepseek" if ds_client else "none")})
 
-PROMPT = """You are an Australian ED clinical assistant. Answer succinctly (~180 words)
-with sections:
+PROMPT = """You are an Australian ED clinical assistant. Answer succinctly (~180 words) with sections:
 1) What it is & criteria
 2) Causes/complications
 3) Immediate management (adult doses/routes/units)
@@ -56,7 +52,7 @@ def answer():
     if not q:
         return jsonify({"ok": False, "error": "Missing 'question'"}), 400
     if not ds_client:
-        return jsonify({"ok": False, "error": "DeepSeek not configured. Set DEEPSEEK_API_KEY and redeploy."}), 200
+        return jsonify({"ok": False, "error": "DeepSeek not configured. Set DEEPSEEK_API_KEY."}), 200
     try:
         r = ds_client.chat.completions.create(
             model="deepseek-chat",
