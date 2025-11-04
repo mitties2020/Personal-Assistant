@@ -1,5 +1,7 @@
-import os, logging
-from flask import Flask, request, jsonify
+from flask_cors import CORS
+
+APP = Flask(__name__)
+CORS(APP, resources={r"/answer": {"origins": "*"}, r"/health": {"origins": "*"}})
 
 # ---- OpenAI (optional but recommended) ----
 from openai import OpenAI
