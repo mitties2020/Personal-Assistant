@@ -5,7 +5,7 @@ from pathlib import Path
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# LLM client (DeepSeek-style via OpenAI SDK)
+# LLM client (DeepSeek via OpenAI SDK style)
 try:
     from openai import OpenAI
 except Exception:
@@ -37,9 +37,9 @@ CHUNKS, META, VECTORIZER, MATRIX = [], [], None, None
 
 def ensure_dirs():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    gitkeep = DATA_DIR / ".gitkeep"
-    if not gitkeep.exists():
-        gitkeep.touch()
+    gk = DATA_DIR / ".gitkeep"
+    if not gk.exists():
+        gk.touch()
 
 
 def _read_text_file(p: Path) -> str:
@@ -80,7 +80,6 @@ def build_corpus():
 
 
 def semantic_context(query: str, k: int = 5) -> str:
-    """Return top-k similar chunks as context."""
     if not (VECTORIZER and MATRIX is not None and CHUNKS):
         return "(no local context indexed)"
     qv = VECTORIZER.transform([query])
@@ -94,10 +93,10 @@ def semantic_context(query: str, k: int = 5) -> str:
     return "\n\n---\n\n".join(pieces)
 
 
-# Build once on startup
+# Build once at startup
 build_corpus()
 
-# ---------- PROMPT ----------
+# ---------- PROMPT & PARSING ----------
 
 def build_prompt(question: str) -> str:
     ctx = semantic_context(question)
@@ -106,13 +105,13 @@ You are a concise, evidence-based ED clinical assistant in Australia.
 
 Use the CONTEXT if relevant; if not, use safe standard practice.
 Respond ONLY as strict JSON with these keys:
-- "what_it_is_and_criteria": bullet-point summary.
-- "common_causes_and_complications": bullet points.
-- "immediate_management": bullet points with adult doses/routes.
-- "ongoing_care_monitoring": bullet points.
+- "what_it_is_and_criteria"
+- "common_causes_and_complications"
+- "immediate_management"
+- "ongoing_care_monitoring"
 
-Keep it succinct and practical for a senior ED doctor.
-Avoid waffle. No explanations outside the JSON.
+Each value should be either a short paragraph or bullet-style text.
+Keep it ~180 words total, practical for a senior ED doctor. No extra prose.
 
 CONTEXT:
 {ctx}
@@ -122,7 +121,6 @@ QUESTION: {question}
 
 
 def call_llm(prompt: str):
-    """Try DeepSeek then OpenAI. Return (text, provider)."""
     if deepseek_client:
         r = deepseek_client.chat.completions.create(
             model="deepseek-chat",
@@ -143,11 +141,15 @@ def call_llm(prompt: str):
 
 
 def safe_parse_structured(raw: str):
-    """Try to parse JSON; fallback to plain text."""
     try:
         obj = json.loads(raw)
         if isinstance(obj, dict):
-            return obj
+            return {
+                "what_it_is_and_criteria": obj.get("what_it_is_and_criteria") or obj.get("what_it_is"),
+                "common_causes_and_complications": obj.get("common_causes_and_complications"),
+                "immediate_management": obj.get("immediate_management"),
+                "ongoing_care_monitoring": obj.get("ongoing_care_monitoring"),
+            }
     except Exception:
         pass
     return None
@@ -157,7 +159,6 @@ def safe_parse_structured(raw: str):
 
 @APP.route("/", methods=["GET"])
 def home():
-    # Minimal clean UI rendered directly
     return """<!doctype html>
 <html lang="en">
 <head>
@@ -165,37 +166,168 @@ def home():
 <title>Personal Assistant — Doctor View</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body{font-family:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;
-     max-width:760px;margin:24px auto;padding:0 16px;color:#111827;background:#f9fafb}
-h1{font-size:24px;margin-bottom:4px}
-.sub{font-size:13px;color:#6b7280;margin-bottom:16px}
-textarea{width:100%;min-height:80px;padding:10px 12px;border-radius:10px;border:1px solid #d1d5db;
-         font-size:14px;resize:vertical;box-sizing:border-box;background:#ffffff}
-button{margin-top:8px;width:100%;padding:11px 14px;background:#111827;color:white;border:none;
-       border-radius:10px;font-size:15px;font-weight:500;cursor:pointer}
-button:hover{background:#000000}
-#card{margin-top:16px;background:#ffffff;border-radius:14px;padding:14px 14px 10px;
-      box-shadow:0 8px 18px rgba(15,23,42,0.08);display:none}
-.sec-title{font-weight:600;font-size:13px;margin:8px 0 2px;color:#111827}
-ul{margin:0 0 4px 16px;padding:0;font-size:13px;color:#111827}
-li{margin:0 0 2px}
-.meta{font-size:11px;color:#9ca3af;margin-top:4px}
-.err{color:#b91c1c;font-size:12px;margin-top:4px;white-space:pre-wrap}
+:root{
+  --bg:#020817;
+  --card:#0f172a;
+  --accent:#38bdf8;
+  --accent-soft:rgba(56,189,248,0.12);
+  --text:#e5e7eb;
+  --muted:#9ca3af;
+  --danger:#fca5a5;
+  --radius:18px;
+  --shadow:0 18px 40px rgba(15,23,42,0.55);
+  --font:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;
+}
+*{box-sizing:border-box;}
+body{
+  margin:0;
+  min-height:100vh;
+  font-family:var(--font);
+  background:
+    radial-gradient(circle at top, rgba(56,189,248,0.14), transparent 55%),
+    radial-gradient(circle at bottom, rgba(14,165,233,0.04), transparent 55%),
+    var(--bg);
+  color:var(--text);
+  display:flex;
+  justify-content:center;
+}
+.wrap{
+  width:100%;
+  max-width:780px;
+  padding:26px 16px 32px;
+}
+.header{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  margin-bottom:4px;
+}
+.icon{
+  width:30px;
+  height:30px;
+  border-radius:50%;
+  background:var(--accent-soft);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:17px;
+  color:var(--accent);
+}
+h1{
+  font-size:22px;
+  margin:0;
+  font-weight:600;
+}
+.sub{
+  font-size:12px;
+  color:var(--muted);
+  margin-bottom:18px;
+}
+.label{
+  font-size:12px;
+  color:var(--accent);
+  margin-bottom:4px;
+  letter-spacing:0.02em;
+  text-transform:uppercase;
+}
+textarea{
+  width:100%;
+  min-height:70px;
+  padding:10px 12px;
+  border-radius:12px;
+  border:1px solid rgba(148,163,253,0.28);
+  background:rgba(2,6,23,0.98);
+  color:var(--text);
+  font-size:13px;
+  resize:vertical;
+  outline:none;
+}
+textarea::placeholder{
+  color:#6b7280;
+}
+button{
+  margin-top:8px;
+  width:100%;
+  padding:11px 14px;
+  background:linear-gradient(to right,#38bdf8,#22c55e);
+  color:#020817;
+  border:none;
+  border-radius:999px;
+  font-size:14px;
+  font-weight:600;
+  cursor:pointer;
+  box-shadow:0 10px 30px rgba(15,23,42,0.75);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:6px;
+}
+button span.icon-s{
+  font-size:16px;
+}
+button:hover{
+  transform:translateY(-1px);
+}
+#card{
+  margin-top:16px;
+  background:var(--card);
+  border-radius:var(--radius);
+  padding:14px 14px 10px;
+  box-shadow:var(--shadow);
+  display:none;
+}
+.sec-title{
+  font-weight:600;
+  font-size:11px;
+  margin:8px 0 2px;
+  color:var(--accent);
+  text-transform:uppercase;
+  letter-spacing:0.05em;
+}
+ul{
+  margin:0 0 4px 14px;
+  padding:0;
+  font-size:12px;
+  color:var(--text);
+}
+li{
+  margin:0 0 2px;
+}
+.meta{
+  font-size:10px;
+  color:var(--muted);
+  margin-top:6px;
+}
+.err{
+  color:var(--danger);
+  font-size:10px;
+  margin-top:4px;
+  white-space:pre-wrap;
+}
 </style>
 </head>
 <body>
-<h1>Personal Assistant</h1>
-<div class="sub">One-line clinical question → crisp 4-part answer (ED-focused, adult doses).</div>
-<textarea id="q" placeholder="e.g. Anaphylaxis adult: immediate and ongoing management"></textarea>
-<button id="ask">Answer</button>
+<div class="wrap">
+  <div class="header">
+    <div class="icon">⚕️</div>
+    <div>
+      <h1>Personal Assistant — Doctor View</h1>
+      <div class="sub">One-line clinical question → crisp 4-part ED summary (adult-focused).</div>
+    </div>
+  </div>
 
-<div id="card">
-  <div id="what" class="sec"></div>
-  <div id="causes" class="sec"></div>
-  <div id="immed" class="sec"></div>
-  <div id="ongoing" class="sec"></div>
-  <div id="meta" class="meta"></div>
-  <div id="err" class="err"></div>
+  <div class="label">Name your clinical question</div>
+  <textarea id="q" placeholder="e.g. Anaphylaxis in adults: definition, immediate management, and observation plan."></textarea>
+  <button id="ask"><span class="icon-s">⚡</span><span>Generate answer</span></button>
+
+  <div id="card">
+    <div id="what"></div>
+    <div id="causes"></div>
+    <div id="immed"></div>
+    <div id="ongoing"></div>
+    <div id="meta" class="meta"></div>
+    <div id="err" class="err"></div>
+  </div>
 </div>
 
 <script>
@@ -208,11 +340,16 @@ async function ask(){
   const ongoing = document.getElementById('ongoing');
   const meta = document.getElementById('meta');
   const err = document.getElementById('err');
+
   if(!q) return;
+
   card.style.display = 'block';
-  what.textContent = causes.textContent = immed.textContent = ongoing.textContent = '';
-  meta.textContent = ''; err.textContent = '';
   what.innerHTML = '<div class="sec-title">What it is & criteria</div><ul><li>Working…</li></ul>';
+  causes.innerHTML = '';
+  immed.innerHTML = '';
+  ongoing.innerHTML = '';
+  meta.textContent = '';
+  err.textContent = '';
 
   try{
     const r = await fetch('/answer',{
@@ -223,17 +360,20 @@ async function ask(){
     const j = await r.json();
 
     if(!j.ok){
-      err.textContent = j.error || 'Error.';
+      err.textContent = j.error || 'Error generating answer.';
       meta.textContent = j.provider ? ('Provider: '+j.provider) : '';
       return;
     }
 
     const s = j.structured || {};
+
     function asList(val){
       if(!val) return '';
-      if(Array.isArray(val)) return '<ul>'+val.map(v=>'<li>'+String(v)+'</li>').join('')+'</ul>';
+      if(Array.isArray(val)){
+        if(!val.length) return '';
+        return '<ul>'+val.map(v => '<li>'+String(v)+'</li>').join('')+'</ul>';
+      }
       if(typeof val === 'string'){
-        // split into bullets on newline / • / -
         const parts = val.split(/[\n•\-]+/).map(t=>t.trim()).filter(Boolean);
         if(parts.length <= 1) return '<ul><li>'+val+'</li></ul>';
         return '<ul>'+parts.map(p=>'<li>'+p+'</li>').join('')+'</ul>';
@@ -241,24 +381,39 @@ async function ask(){
       return '<ul><li>'+String(val)+'</li></ul>';
     }
 
-    what.innerHTML   = '<div class="sec-title">What it is & criteria</div>' + asList(s.what_it_is_and_criteria);
-    causes.innerHTML = '<div class="sec-title">Common causes & complications</div>' + asList(s.common_causes_and_complications);
-    immed.innerHTML  = '<div class="sec-title">Immediate management</div>' + asList(s.immediate_management);
-    ongoing.innerHTML= '<div class="sec-title">Ongoing care / monitoring</div>' + asList(s.ongoing_care_monitoring);
+    what.innerHTML =
+      '<div class="sec-title">What it is & criteria</div>' +
+      (asList(s.what_it_is_and_criteria) || '<ul><li>No data.</li></ul>');
 
-    meta.textContent = (j.provider ? ('Provider: '+j.provider+'. ') : '') +
-                       (j.context_used ? 'Local context used.' : '');
+    causes.innerHTML =
+      '<div class="sec-title">Common causes & complications</div>' +
+      (asList(s.common_causes_and_complications) || '<ul><li>No data.</li></ul>');
+
+    immed.innerHTML =
+      '<div class="sec-title">Immediate management</div>' +
+      (asList(s.immediate_management) || '<ul><li>No data.</li></ul>');
+
+    ongoing.innerHTML =
+      '<div class="sec-title">Ongoing care / monitoring</div>' +
+      (asList(s.ongoing_care_monitoring) || '<ul><li>No data.</li></ul>');
+
+    meta.textContent =
+      (j.provider ? ('Provider: '+j.provider+'. ') : '') +
+      (j.context_used ? 'Local clinical_data context applied.' : '');
+
     err.textContent = '';
 
   }catch(e){
-    err.textContent = 'Request failed: '+e.message;
+    err.textContent = 'Network or server error: '+e.message;
+    meta.textContent = '';
   }
 }
 
-document.getElementById('ask').onclick = ask;
+document.getElementById('ask').addEventListener('click', ask);
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 
 @APP.route("/answer", methods=["POST"])
@@ -275,12 +430,13 @@ def answer():
         return jsonify({"ok": False, "error": f"{e}", "provider": "none"}), 200
 
     structured = safe_parse_structured(raw)
+
     return jsonify({
         "ok": True,
         "provider": provider,
         "structured": structured,
         "answer": raw,
-        "context_used": True  # semantic_context always runs, harmless flag
+        "context_used": True
     })
 
 
