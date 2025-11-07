@@ -1,9 +1,0 @@
-Personal-Assistant/
-  ffm_flask2.py
-  Dockerfile
-  requirements.txt
-  clinical_data/
-    anaphylaxis_ascia_2024.pdf
-    hyperkalaemia_nsw_ed_summary.pdf
-    my_notes.md
-    bundle1.zip
