@@ -1,419 +1,409 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import os, chardet, json
+import os, io, zipfile, chardet
 from pathlib import Path
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
-# LLM client (DeepSeek via OpenAI SDK style)
+# Optional LLM (DeepSeek via OpenAI client-style; safe if not configured)
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+client = OpenAI(base_url="https://api.deepseek.com",
+                api_key=DEEPSEEK_API_KEY) if (OpenAI and DEEPSEEK_API_KEY) else None
+
+# Optional fallback: OpenAI key (only used if DeepSeek not set)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+oa_client = OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY and not client) else None
+
 APP = Flask(__name__)
 CORS(APP, resources={
     r"/answer": {"origins": "*"},
     r"/health": {"origins": "*"},
-    r"/reindex": {"origins": "*"}
+    r"/reindex": {"origins": "*"},
 })
 
-# ---------- AI SETUP ----------
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
-deepseek_client = OpenAI(
-    base_url="https://api.deepseek.com",
-    api_key=DEEPSEEK_API_KEY
-) if (OpenAI and DEEPSEEK_API_KEY) else None
+# ---------- Local corpus (clinical_data) ----------
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-openai_client = OpenAI(
-    api_key=OPENAI_API_KEY
-) if (OpenAI and OPENAI_API_KEY and not deepseek_client) else None
-
-# ---------- CORPUS (TXT ONLY) ----------
 DATA_DIR = Path("clinical_data")
-CHUNKS, META, VECTORIZER, MATRIX = [], [], None, None
+UNZIP_DIR = DATA_DIR / "_unzipped"
+TEXT_CACHE = DATA_DIR / "_text_cache"
+CORPUS = {}  # {filepath: text}
 
 
 def ensure_dirs():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    gk = DATA_DIR / ".gitkeep"
-    if not gk.exists():
-        gk.touch()
+    # if something weird exists with these names as files, ignore failure
+    for d in (UNZIP_DIR, TEXT_CACHE):
+        try:
+            if d.exists() and not d.is_dir():
+                d.unlink()
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
 
 
 def _read_text_file(p: Path) -> str:
     raw = p.read_bytes()
-    enc = chardet.detect(raw).get("encoding") or "utf-8"
+    enc = (chardet.detect(raw).get("encoding") or "utf-8")
     try:
         return raw.decode(enc, errors="ignore")
     except Exception:
         return raw.decode("utf-8", errors="ignore")
 
 
-def build_corpus():
-    """Index all .txt files into TF-IDF matrix."""
-    global CHUNKS, META, VECTORIZER, MATRIX
-    ensure_dirs()
-    CHUNKS, META = [], []
+def _pdf_to_txt(src: Path) -> Path:
+    try:
+        from pdfminer.high_level import extract_text
+        text = extract_text(str(src)) or ""
+    except Exception:
+        text = ""
+    out = TEXT_CACHE / (src.stem + ".txt")
+    out.write_text(text, encoding="utf-8", errors="ignore")
+    return out
 
-    for path in DATA_DIR.rglob("*.txt"):
-        if path.name.startswith("."):
-            continue
-        txt = _read_text_file(path)
-        if not txt.strip():
-            continue
-        i = 0
-        while i < len(txt):
-            chunk = txt[i:i + 1200].strip()
-            if chunk:
-                CHUNKS.append(chunk)
-                META.append({"path": str(path), "offset": i})
-            i += 900
 
-    if not CHUNKS:
-        VECTORIZER, MATRIX = None, None
+def _docx_to_txt(src: Path) -> Path:
+    try:
+        from docx import Document
+        doc = Document(str(src))
+        text = "\n".join(p.text for p in doc.paragraphs)
+    except Exception:
+        text = ""
+    out = TEXT_CACHE / (src.stem + ".txt")
+    out.write_text(text, encoding="utf-8", errors="ignore")
+    return out
+
+
+def _maybe_unzip(p: Path):
+    try:
+        tgt = UNZIP_DIR / p.stem
+        if not tgt.exists():
+            tgt.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(p, "r") as zf:
+                zf.extractall(tgt)
+        return tgt
+    except Exception:
+        return None
+
+
+def _collect_texts(root: Path):
+    if not root.exists():
         return
+    for path in root.rglob("*"):
+        if path.is_dir():
+            continue
+        ext = path.suffix.lower()
+        if ext in (".md", ".txt"):
+            yield (path, _read_text_file(path))
+        elif ext == ".pdf":
+            t = _pdf_to_txt(path)
+            yield (path, _read_text_file(t))
+        elif ext == ".docx":
+            t = _docx_to_txt(path)
+            yield (path, _read_text_file(t))
+        elif ext == ".zip":
+            unzip = _maybe_unzip(path)
+            if unzip:
+                yield from _collect_texts(unzip)
 
-    VECTORIZER = TfidfVectorizer(stop_words="english", max_features=40000)
-    MATRIX = VECTORIZER.fit_transform(CHUNKS)
+
+def build_corpus():
+    ensure_dirs()
+    CORPUS.clear()
+    for fp, text in _collect_texts(DATA_DIR) or []:
+        if text and text.strip():
+            CORPUS[str(fp)] = text
 
 
-def semantic_context(query: str, k: int = 5) -> str:
-    if not (VECTORIZER and MATRIX is not None and CHUNKS):
-        return "(no local context indexed)"
-    qv = VECTORIZER.transform([query])
-    sims = cosine_similarity(qv, MATRIX)[0]
-    top = sims.argsort()[::-1][:k]
-    pieces = []
-    for i in top:
-        score = sims[i]
-        meta = META[i]
-        pieces.append(f"[{meta['path']} | {score:.2f}]\n{CHUNKS[i]}")
-    return "\n\n---\n\n".join(pieces)
-
-
-# Build once at startup
+# initial load
 build_corpus()
 
-# ---------- PROMPT & PARSING ----------
+# ---------- UI ----------
 
-def build_prompt(question: str) -> str:
-    ctx = semantic_context(question)
-    return f"""
-You are a concise, evidence-based ED clinical assistant in Australia.
-
-Use the CONTEXT if relevant; if not, use safe standard practice.
-Respond ONLY as strict JSON with these keys:
-- "what_it_is_and_criteria"
-- "common_causes_and_complications"
-- "immediate_management"
-- "ongoing_care_monitoring"
-
-Each value should be either a short paragraph or bullet-style text.
-Keep it ~180 words total, practical for a senior ED doctor. No extra prose.
-
-CONTEXT:
-{ctx}
-
-QUESTION: {question}
-""".strip()
-
-
-def call_llm(prompt: str):
-    if deepseek_client:
-        r = deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.15,
-        )
-        return (r.choices[0].message.content or "").strip(), "deepseek"
-
-    if openai_client:
-        r = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.15,
-        )
-        return (r.choices[0].message.content or "").strip(), "openai"
-
-    raise RuntimeError("No AI configured (set DEEPSEEK_API_KEY or OPENAI_API_KEY).")
-
-
-def safe_parse_structured(raw: str):
-    try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return {
-                "what_it_is_and_criteria": obj.get("what_it_is_and_criteria") or obj.get("what_it_is"),
-                "common_causes_and_complications": obj.get("common_causes_and_complications"),
-                "immediate_management": obj.get("immediate_management"),
-                "ongoing_care_monitoring": obj.get("ongoing_care_monitoring"),
-            }
-    except Exception:
-        pass
-    return None
-
-
-# ---------- ROUTES ----------
 
 @APP.route("/", methods=["GET"])
-def home():
+def root():
+    # Single-page minimal UI
     return """<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<title>Personal Assistant — Doctor View</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-:root{
-  --bg:#020817;
-  --card:#0f172a;
-  --accent:#38bdf8;
-  --accent-soft:rgba(56,189,248,0.12);
-  --text:#e5e7eb;
-  --muted:#9ca3af;
-  --danger:#fca5a5;
-  --radius:18px;
-  --shadow:0 18px 40px rgba(15,23,42,0.55);
-  --font:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;
-}
-*{box-sizing:border-box;}
-body{
-  margin:0;
-  min-height:100vh;
-  font-family:var(--font);
-  background:
-    radial-gradient(circle at top, rgba(56,189,248,0.14), transparent 55%),
-    radial-gradient(circle at bottom, rgba(14,165,233,0.04), transparent 55%),
-    var(--bg);
-  color:var(--text);
-  display:flex;
-  justify-content:center;
-}
-.wrap{
-  width:100%;
-  max-width:780px;
-  padding:26px 16px 32px;
-}
-.header{
-  display:flex;
-  align-items:center;
-  gap:10px;
-  margin-bottom:4px;
-}
-.icon{
-  width:30px;
-  height:30px;
-  border-radius:50%;
-  background:var(--accent-soft);
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  font-size:17px;
-  color:var(--accent);
-}
-h1{
-  font-size:22px;
-  margin:0;
-  font-weight:600;
-}
-.sub{
-  font-size:12px;
-  color:var(--muted);
-  margin-bottom:18px;
-}
-.label{
-  font-size:12px;
-  color:var(--accent);
-  margin-bottom:4px;
-  letter-spacing:0.02em;
-  text-transform:uppercase;
-}
-textarea{
-  width:100%;
-  min-height:70px;
-  padding:10px 12px;
-  border-radius:12px;
-  border:1px solid rgba(148,163,253,0.28);
-  background:rgba(2,6,23,0.98);
-  color:var(--text);
-  font-size:13px;
-  resize:vertical;
-  outline:none;
-}
-textarea::placeholder{
-  color:#6b7280;
-}
-button{
-  margin-top:8px;
-  width:100%;
-  padding:11px 14px;
-  background:linear-gradient(to right,#38bdf8,#22c55e);
-  color:#020817;
-  border:none;
-  border-radius:999px;
-  font-size:14px;
-  font-weight:600;
-  cursor:pointer;
-  box-shadow:0 10px 30px rgba(15,23,42,0.75);
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  gap:6px;
-}
-button span.icon-s{
-  font-size:16px;
-}
-button:hover{
-  transform:translateY(-1px);
-}
-#card{
-  margin-top:16px;
-  background:var(--card);
-  border-radius:var(--radius);
-  padding:14px 14px 10px;
-  box-shadow:var(--shadow);
-  display:none;
-}
-.sec-title{
-  font-weight:600;
-  font-size:11px;
-  margin:8px 0 2px;
-  color:var(--accent);
-  text-transform:uppercase;
-  letter-spacing:0.05em;
-}
-ul{
-  margin:0 0 4px 14px;
-  padding:0;
-  font-size:12px;
-  color:var(--text);
-}
-li{
-  margin:0 0 2px;
-}
-.meta{
-  font-size:10px;
-  color:var(--muted);
-  margin-top:6px;
-}
-.err{
-  color:var(--danger);
-  font-size:10px;
-  margin-top:4px;
-  white-space:pre-wrap;
-}
-</style>
+  <meta charset="utf-8">
+  <title>FFM Clinical Assistant</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root {
+      --bg:#030712;
+      --card:#0f172a;
+      --accent:#38bdf8;
+      --accent-soft:rgba(56,189,248,0.12);
+      --text:#e5e7eb;
+      --muted:#9ca3af;
+      --radius:18px;
+      --font:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;
+    }
+    *{box-sizing:border-box;}
+    body{
+      margin:0;
+      min-height:100vh;
+      font-family:var(--font);
+      background:radial-gradient(circle at top,var(--accent-soft),var(--bg));
+      color:var(--text);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      padding:18px;
+    }
+    .wrap{
+      width:100%;
+      max-width:720px;
+      background:linear-gradient(to bottom right,rgba(148,163,253,0.06),rgba(15,23,42,0.98));
+      border-radius:24px;
+      padding:20px 20px 18px;
+      box-shadow:0 18px 55px rgba(15,23,42,0.9);
+      border:1px solid rgba(148,163,253,0.15);
+      backdrop-filter:blur(14px);
+    }
+    .header{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      margin-bottom:8px;
+    }
+    .pill{
+      padding:3px 10px;
+      border-radius:999px;
+      font-size:10px;
+      color:var(--accent);
+      background:var(--accent-soft);
+      border:1px solid rgba(56,189,248,0.35);
+    }
+    h1{
+      font-size:20px;
+      margin:0;
+      font-weight:600;
+      letter-spacing:0.02em;
+    }
+    p.sub{
+      margin:2px 0 14px;
+      font-size:12px;
+      color:var(--muted);
+    }
+    label{
+      font-size:11px;
+      color:var(--muted);
+      display:block;
+      margin-bottom:4px;
+      letter-spacing:0.06em;
+      text-transform:uppercase;
+    }
+    textarea{
+      width:100%;
+      min-height:80px;
+      max-height:180px;
+      resize:vertical;
+      padding:10px 11px;
+      border-radius:var(--radius);
+      border:1px solid rgba(148,163,253,0.25);
+      background:rgba(2,6,23,0.9);
+      color:var(--text);
+      font-size:13px;
+      outline:none;
+      box-shadow:inset 0 0 0 1px transparent;
+    }
+    textarea::placeholder{color:#6b7280;}
+    textarea:focus{
+      border-color:var(--accent);
+      box-shadow:0 0 0 1px rgba(56,189,248,0.35);
+    }
+    button{
+      margin-top:8px;
+      width:100%;
+      padding:10px 12px;
+      border-radius:var(--radius);
+      border:none;
+      font-weight:500;
+      font-size:13px;
+      letter-spacing:0.04em;
+      text-transform:uppercase;
+      background:linear-gradient(to right,var(--accent),#6366f1);
+      color:#020817;
+      cursor:pointer;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      gap:8px;
+      box-shadow:0 10px 30px rgba(37,99,235,0.45);
+    }
+    button span.icon{
+      display:inline-block;
+      transform:translateY(1px);
+    }
+    button:active{
+      transform:translateY(1px);
+      box-shadow:0 4px 16px rgba(15,23,42,0.9);
+    }
+    .answer{
+      margin-top:10px;
+      padding:9px 10px;
+      border-radius:var(--radius);
+      background:rgba(2,6,23,0.96);
+      border:1px solid rgba(75,85,99,0.6);
+      font-size:12px;
+      line-height:1.5;
+      white-space:pre-wrap;
+      max-height:260px;
+      overflow-y:auto;
+    }
+    .answer.empty{
+      color:#6b7280;
+      border-style:dashed;
+      text-align:left;
+    }
+    .meta{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      margin-top:4px;
+      font-size:9px;
+      color:var(--muted);
+    }
+    .status-dot{
+      width:7px;height:7px;
+      border-radius:999px;
+      background:#22c55e;
+      box-shadow:0 0 8px #22c55e;
+      display:inline-block;
+      margin-right:4px;
+    }
+  </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="header">
-    <div class="icon">⚕️</div>
-    <div>
-      <h1>Personal Assistant — Doctor View</h1>
-      <div class="sub">One-line clinical question → crisp 4-part ED summary (adult-focused).</div>
+  <div class="wrap">
+    <div class="header">
+      <div class="pill">FFM • Clinical Q&A Engine</div>
+    </div>
+    <h1>Name your clinical question</h1>
+    <p class="sub">
+      One-line question in → structured, high-yield answer out. 
+      Built for ED workflow. Always confirm with local guidelines.
+    </p>
+    <label for="q">Clinical question</label>
+    <textarea id="q" placeholder="e.g. Hyperkalaemia with broad QRS: immediate management"></textarea>
+    <button id="ask">
+      <span class="icon">➜</span>
+      <span>Get answer</span>
+    </button>
+    <div id="ans" class="answer empty">
+      Response will appear here in 4 clear sections:
+      1) What it is & criteria · 2) Causes & complications · 3) Immediate management · 4) Ongoing care.
+    </div>
+    <div class="meta">
+      <div><span class="status-dot"></span>Backend online</div>
+      <div id="provider">Model: local data / API hybrid</div>
     </div>
   </div>
+  <script>
+    const qEl = document.getElementById('q');
+    const ansEl = document.getElementById('ans');
+    const providerEl = document.getElementById('provider');
+    const btn = document.getElementById('ask');
 
-  <div class="label">Name your clinical question</div>
-  <textarea id="q" placeholder="e.g. Anaphylaxis in adults: definition, immediate management, and observation plan."></textarea>
-  <button id="ask"><span class="icon-s">⚡</span><span>Generate answer</span></button>
+    async function ask() {
+      const q = qEl.value.trim();
+      if (!q) return;
+      ansEl.classList.remove('empty');
+      ansEl.textContent = "Thinking...";
+      providerEl.textContent = "Model: resolving…";
+      try {
+        const res = await fetch('/answer', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({question: q})
+        });
+        const j = await res.json();
+        if (j.ok && j.answer) {
+          ansEl.textContent = j.answer;
+        } else {
+          ansEl.textContent = j.error || "No response from engine.";
+        }
+        providerEl.textContent = "Model: " + (j.provider || 'none');
+      } catch (e) {
+        ansEl.textContent = "Network or server error. Please try again.";
+        providerEl.textContent = "Model: error";
+      }
+    }
 
-  <div id="card">
-    <div id="what"></div>
-    <div id="causes"></div>
-    <div id="immed"></div>
-    <div id="ongoing"></div>
-    <div id="meta" class="meta"></div>
-    <div id="err" class="err"></div>
-  </div>
-</div>
-
-<script>
-async function ask(){
-  const q = document.getElementById('q').value.trim();
-  const card = document.getElementById('card');
-  const what = document.getElementById('what');
-  const causes = document.getElementById('causes');
-  const immed = document.getElementById('immed');
-  const ongoing = document.getElementById('ongoing');
-  const meta = document.getElementById('meta');
-  const err = document.getElementById('err');
-
-  if(!q) return;
-
-  card.style.display = 'block';
-  what.innerHTML = '<div class="sec-title">What it is & criteria</div><ul><li>Working…</li></ul>';
-  causes.innerHTML = '';
-  immed.innerHTML = '';
-  ongoing.innerHTML = '';
-  meta.textContent = '';
-  err.textContent = '';
-
-  try{
-    const r = await fetch('/answer',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({question:q})
+    btn.addEventListener('click', ask);
+    qEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        ask();
+      }
     });
-    const j = await r.json();
-
-    if(!j.ok){
-      err.textContent = j.error || 'Error generating answer.';
-      meta.textContent = j.provider ? ('Provider: '+j.provider) : '';
-      return;
-    }
-
-    const s = j.structured || {};
-
-    function asList(val){
-      if(!val) return '';
-      if(Array.isArray(val)){
-        if(!val.length) return '';
-        return '<ul>'+val.map(v => '<li>'+String(v)+'</li>').join('')+'</ul>';
-      }
-      if(typeof val === 'string'){
-        const parts = val.split(/[\n•\-]+/).map(t=>t.trim()).filter(Boolean);
-        if(parts.length <= 1) return '<ul><li>'+val+'</li></ul>';
-        return '<ul>'+parts.map(p=>'<li>'+p+'</li>').join('')+'</ul>';
-      }
-      return '<ul><li>'+String(val)+'</li></ul>';
-    }
-
-    what.innerHTML =
-      '<div class="sec-title">What it is & criteria</div>' +
-      (asList(s.what_it_is_and_criteria) || '<ul><li>No data.</li></ul>');
-
-    causes.innerHTML =
-      '<div class="sec-title">Common causes & complications</div>' +
-      (asList(s.common_causes_and_complications) || '<ul><li>No data.</li></ul>');
-
-    immed.innerHTML =
-      '<div class="sec-title">Immediate management</div>' +
-      (asList(s.immediate_management) || '<ul><li>No data.</li></ul>');
-
-    ongoing.innerHTML =
-      '<div class="sec-title">Ongoing care / monitoring</div>' +
-      (asList(s.ongoing_care_monitoring) || '<ul><li>No data.</li></ul>');
-
-    meta.textContent =
-      (j.provider ? ('Provider: '+j.provider+'. ') : '') +
-      (j.context_used ? 'Local clinical_data context applied.' : '');
-
-    err.textContent = '';
-
-  }catch(e){
-    err.textContent = 'Network or server error: '+e.message;
-    meta.textContent = '';
-  }
-}
-
-document.getElementById('ask').addEventListener('click', ask);
-</script>
+  </script>
 </body>
 </html>
 """
+
+
+@APP.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "files_indexed": len(CORPUS)})
+
+
+@APP.route("/reindex", methods=["POST", "GET"])
+def reindex():
+    build_corpus()
+    return jsonify({"ok": True, "files_indexed": len(CORPUS)})
+
+
+def build_prompt(question: str) -> str:
+    # naive keyword-based context from CORPUS
+    qlow = question.lower()
+    hits = []
+    for path, text in CORPUS.items():
+        if any(k in text.lower() for k in qlow.split()[:5]):
+            hits.append((path, text[:4000]))
+        if len(hits) >= 6:
+            break
+    context = "\n\n---\n\n".join(f"[[{p}]]\n{text}" for p, text in hits) or "(no local context matched)"
+    return f"""You are a concise clinical assistant for an Australian ED doctor.
+Use the CONTEXT if relevant, otherwise answer from your usual knowledge.
+Keep the answer around 180 words with EXACT sections:
+1) What it is & criteria
+2) Common causes & complications
+3) Immediate management (adult doses, units, routes)
+4) Ongoing care / monitoring
+
+CONTEXT:
+{context}
+
+QUESTION: {question}
+"""
+
+
+def call_deepseek(prompt: str) -> str:
+    if not client:
+        raise RuntimeError("DeepSeek not configured.")
+    r = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    return (r.choices[0].message.content or "").strip()
+
+
+def call_openai(prompt: str) -> str:
+    if not oa_client:
+        raise RuntimeError("OpenAI not configured.")
+    r = oa_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    return (r.choices[0].message.content or "").strip()
 
 
 @APP.route("/answer", methods=["POST"])
@@ -424,31 +414,29 @@ def answer():
         return jsonify({"ok": False, "error": "Missing 'question'"}), 400
 
     prompt = build_prompt(q)
+
     try:
-        raw, provider = call_llm(prompt)
+        if client:
+            text = call_deepseek(prompt)
+            return jsonify({"ok": True, "provider": "deepseek", "answer": text})
+        elif oa_client:
+            text = call_openai(prompt)
+            return jsonify({"ok": True, "provider": "openai", "answer": text})
+        else:
+            # Still respond so the UI doesn’t look broken
+            return jsonify({
+                "ok": True,
+                "provider": "none",
+                "answer": (
+                    "Backend is running.\n\n"
+                    "- To enable AI answers: set DEEPSEEK_API_KEY (or OPENAI_API_KEY) "
+                    "in your Render Environment and redeploy.\n"
+                    "- You can already attach local files into clinical_data/ and reindex."
+                )
+            })
     except Exception as e:
-        return jsonify({"ok": False, "error": f"{e}", "provider": "none"}), 200
-
-    structured = safe_parse_structured(raw)
-
-    return jsonify({
-        "ok": True,
-        "provider": provider,
-        "structured": structured,
-        "answer": raw,
-        "context_used": True
-    })
-
-
-@APP.route("/reindex", methods=["POST", "GET"])
-def reindex():
-    build_corpus()
-    return jsonify({"ok": True, "files_indexed": len(CHUNKS)})
-
-
-@APP.route("/health", methods=["GET"])
-def health():
-    return jsonify({"ok": True, "files_indexed": len(CHUNKS)})
+        # Quota / balance / API errors show to user but don’t kill service
+        return jsonify({"ok": False, "error": f"AI unavailable: {e}"}), 200
 
 
 if __name__ == "__main__":
