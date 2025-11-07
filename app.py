@@ -1,28 +1,18 @@
-# app.py
 import os
+import requests
 from flask import Flask, request, jsonify, render_template
-from openai import OpenAI
 from dotenv import load_dotenv
-
-# ---------------- CONFIG ----------------
-# 1️⃣  Create a file called ".env" in the same folder as this app.py
-#     and put this inside (replace with your own key):
-#     OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxx
-#
-# 2️⃣  Then run:
-#     pip install flask openai python-dotenv
-# ----------------------------------------
 
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("❌ Missing OPENAI_API_KEY in .env file")
+API_KEY = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
+MODEL = os.getenv("OPENAI_MODEL", "deepseek-chat")
+DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+if not API_KEY:
+    raise RuntimeError("Missing DEEPSEEK_API_KEY in .env")
+
 app = Flask(__name__, template_folder="templates")
-
-# ---------------- ROUTES ----------------
 
 @app.route("/")
 def home():
@@ -30,40 +20,62 @@ def home():
 
 @app.route("/api/clinical-qa", methods=["POST"])
 def clinical_qa():
-    """
-    Receives a JSON object: {"question": "text here"}
-    Sends it to OpenAI/DeepSeek and returns structured answer JSON.
-    """
     data = request.get_json(silent=True) or {}
-    question = data.get("question", "").strip()
+    question = (data.get("question") or "").strip()
+
     if not question:
         return jsonify({"error": "No clinical question received."}), 400
 
     system_prompt = (
-        "You are a structured, evidence-based clinical Q&A assistant. "
-        "Provide concise, high-yield answers following Australian clinical standards. "
-        "Sections: Overview, Assessment, Risk Stratification, Management, Monitoring, Key References. "
-        "Include a disclaimer: 'Always verify with local policies and senior review.'"
+        "You are a clinical question-to-answer engine for doctors in Australia. "
+        "Return a single, structured, high-yield answer per query.\n\n"
+        "Format your response with clear markdown headings:\n"
+        "1. Overview\n"
+        "2. Assessment\n"
+        "3. Risk Stratification\n"
+        "4. Management (stepwise, include first-line, second-line, doses if standard)\n"
+        "5. Monitoring & Follow-up\n"
+        "6. Red Flags / When to escalate\n"
+        "7. Key References (guidelines / major trials only)\n\n"
+        "Rules:\n"
+        "- Base answers on accepted evidence & guidelines.\n"
+        "- If uncertain, say so; do NOT fabricate data.\n"
+        "- Assume adult patients unless specified.\n"
+        "- Assume Australian context if relevant.\n"
+        "- End every answer with: 'Always verify with local policies, product information, and senior review before acting.'"
     )
 
     try:
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini",  # or deepseek-chat if using DeepSeek/OpenRouter
-            messages=[
+        payload = {
+            "model": MODEL,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": question},
             ],
-            temperature=0.3,
-            max_tokens=900,
-        )
+            "temperature": 0.3,
+            "max_tokens": 900,
+        }
 
-        answer = completion.choices[0].message.content.strip()
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=60)
+
+        if resp.status_code != 200:
+            return jsonify({
+                "error": "DeepSeek API error",
+                "status": resp.status_code,
+                "body": resp.text,
+            }), 500
+
+        data = resp.json()
+        answer = data["choices"][0]["message"]["content"].strip()
         return jsonify({"answer": answer})
 
     except Exception as e:
-        print("⚠️ Error:", e)
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Server exception", "details": str(e)}), 500
 
-# ---------------- RUN APP ----------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
