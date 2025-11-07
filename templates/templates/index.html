@@ -52,11 +52,6 @@
       color: #021024;
     }
     .btn-main:hover { transform: scale(1.05); }
-    .btn-ghost {
-      background: transparent;
-      border: 1px solid rgba(255,255,255,0.3);
-      color: #ccc;
-    }
     .output {
       background: rgba(10,12,18,0.95);
       padding: 16px; border-radius: 12px;
@@ -64,24 +59,16 @@
       font-size: 0.9rem; line-height: 1.6;
       white-space: pre-wrap; min-height: 150px;
     }
-    @media (max-width: 900px) {
-      main { grid-template-columns: 1fr; }
-    }
   </style>
 </head>
 <body>
   <main>
     <section>
       <h1>Clinical Q&A Engine</h1>
-      <p>Enter a focused question to generate a structured, high-yield summary.</p>
-
-      <textarea id="clinicalQuestion"
-        placeholder="e.g. Management of new-onset atrial fibrillation in ED"></textarea>
-
+      <p>Enter a focused clinical question to generate a structured, high-yield answer.</p>
+      <textarea id="clinicalQuestion" placeholder="e.g. Management of new-onset atrial fibrillation in ED"></textarea>
       <div class="buttons">
         <button id="generateBtn" class="btn-main">⚡ Generate</button>
-        <button id="copyBtn" class="btn-ghost">⧉ Copy</button>
-        <button id="exportBtn" class="btn-ghost">⤓ Export</button>
       </div>
     </section>
 
@@ -96,8 +83,6 @@
     const questionInput = document.getElementById("clinicalQuestion");
     const answerBox = document.getElementById("answerBox");
     const generateBtn = document.getElementById("generateBtn");
-    const copyBtn = document.getElementById("copyBtn");
-    const exportBtn = document.getElementById("exportBtn");
 
     async function generateAnswer() {
       const question = questionInput.value.trim();
@@ -105,45 +90,36 @@
         answerBox.textContent = "Please enter a clinical question first.";
         return;
       }
-      answerBox.textContent = "Generating...";
+
+      generateBtn.disabled = true;
+      generateBtn.textContent = "Generating...";
+      answerBox.textContent = "Thinking in a structured way...";
+
       try {
         const res = await fetch("/api/clinical-qa", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ question }),
         });
+
         const data = await res.json();
-        answerBox.textContent =
-          data.answer || data.error || "No answer returned.";
+
+        if (res.ok && data.answer) {
+          answerBox.textContent = data.answer;
+        } else {
+          answerBox.textContent =
+            (data.error || "No answer returned.") +
+            (data.body ? "\n\nDetails:\n" + data.body : "");
+        }
       } catch (e) {
-        answerBox.textContent = "Error connecting to backend.";
+        answerBox.textContent = "Error connecting to backend: " + e.message;
+      } finally {
+        generateBtn.disabled = false;
+        generateBtn.textContent = "⚡ Generate";
       }
     }
 
     generateBtn.addEventListener("click", generateAnswer);
-
-    questionInput.addEventListener("keydown", (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") generateAnswer();
-    });
-
-    copyBtn.addEventListener("click", async () => {
-      const text = answerBox.textContent.trim();
-      if (!text) return;
-      await navigator.clipboard.writeText(text);
-      copyBtn.textContent = "Copied!";
-      setTimeout(() => (copyBtn.textContent = "⧉ Copy"), 1000);
-    });
-
-    exportBtn.addEventListener("click", () => {
-      const text = answerBox.textContent.trim();
-      if (!text) return;
-      const blob = new Blob([text], { type: "text/plain" });
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = "clinical-answer.txt";
-      a.click();
-      URL.revokeObjectURL(a.href);
-    });
   </script>
 </body>
 </html>
