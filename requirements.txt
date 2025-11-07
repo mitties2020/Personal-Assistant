@@ -1,7 +1,7 @@
-flask==3.1.2
-flask-cors==5.0.0
-gunicorn==23.0.0
-openai==2.7.1
-pdfminer.six==20231228
-python-docx==1.1.2
-chardet==5.2.0
+flask
+flask-cors
+chardet
+pdfminer.six
+python-docx
+openai
+gunicorn
